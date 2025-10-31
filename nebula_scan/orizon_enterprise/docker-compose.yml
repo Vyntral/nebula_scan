@@ -1,0 +1,223 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: orizon-postgres
+    environment:
+      POSTGRES_DB: orizon_enterprise
+      POSTGRES_USER: orizon
+      POSTGRES_PASSWORD: orizon_secure_password_change_me
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orizon"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: orizon-redis
+    command: redis-server --appendonly yes --requirepass orizon_redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orizon-api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=orizon
+      - POSTGRES_PASSWORD=orizon_secure_password_change_me
+      - POSTGRES_DB=orizon_enterprise
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=orizon_redis_password
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production-super-secret-key-12345}
+      - CELERY_BROKER_URL=redis://:orizon_redis_password@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:orizon_redis_password@redis:6379/1
+    volumes:
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # Celery Worker
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orizon-celery-worker
+    command: celery -A workers.celery_app worker --loglevel=info --concurrency=10
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=orizon
+      - POSTGRES_PASSWORD=orizon_secure_password_change_me
+      - POSTGRES_DB=orizon_enterprise
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=orizon_redis_password
+      - CELERY_BROKER_URL=redis://:orizon_redis_password@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:orizon_redis_password@redis:6379/1
+    volumes:
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - orizon-network
+    restart: unless-stopped
+    deploy:
+      replicas: 3  # Scale workers for distributed processing
+
+  # Celery Beat (Scheduler)
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orizon-celery-beat
+    command: celery -A workers.celery_app beat --loglevel=info
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=orizon
+      - POSTGRES_PASSWORD=orizon_secure_password_change_me
+      - POSTGRES_DB=orizon_enterprise
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=orizon_redis_password
+      - CELERY_BROKER_URL=redis://:orizon_redis_password@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:orizon_redis_password@redis:6379/1
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # Flower (Celery Monitoring)
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orizon-flower
+    command: celery -A workers.celery_app flower --port=5555
+    environment:
+      - CELERY_BROKER_URL=redis://:orizon_redis_password@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:orizon_redis_password@redis:6379/1
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: orizon-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # Prometheus (Metrics)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: orizon-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+  # Grafana (Monitoring Dashboard)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: orizon-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - orizon-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  orizon-network:
+    driver: bridge
